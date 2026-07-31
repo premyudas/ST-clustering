@@ -1,0 +1,114 @@
+---
+title: "spatialMNN benchmarking"
+output: html_document
+---
+
+```{r}
+
+## Load spatialMNN
+old_wd <- getwd()
+setwd("../../models/spatialMNN")
+source("R/spatialMNN.R")
+source("R/utils.R")
+source("R/plotting_functions.R")
+setwd(old_wd)
+
+## Loader helper functions
+source("benchmarking_scripts_2.R")
+source("constants.R")
+
+library(Seurat)
+library(magrittr)
+library(tidyverse)
+library(ggnewscale) # for new_scale_colour()
+library(igraph)
+library(scry)
+library(scater)
+options(future.globals.maxSize = 4000 * 1024^2)
+```
+
+```{r}
+model <- "spatialMNN"
+
+datasets <- list(
+  # "DLPFC" = DLPFC_files,
+  "HER2+" = HER2_files,
+  "MOSTA" = MOSTA_files
+  # "Mouse hypothalamus" = mouse_hypothalamus_files
+)
+
+loaders <- list(
+  "DLPFC" = load_DLPFC,
+  "HER2+" = load_HER2,
+  "MOSTA" = load_MOSTA
+)
+
+assay_names <- list(
+  "DLPFC" = "counts",
+  "HER2+" = "counts",
+  "MOSTA" = "count"
+)
+
+```
+
+
+```{r benchmarking-loop}
+dlpfc_ref  <- load_DLPFC("151507")
+dlpfc_median_nn <- get_median_nn_distance(reducedDim(dlpfc_ref$sce, "spatial"))
+message(sprintf("DLPFC reference median NN distance: %.2f", dlpfc_median_nn))
+
+for (dataset_name in names(datasets)) {
+  loader <- loaders[[dataset_name]]
+  assay_name <- assay_names[[dataset_name]]
+
+  for (file in names(datasets[[dataset_name]])) {
+    loaded <- loader(file)
+
+    start_time <- Sys.time()
+    sce <- preprocess_data(loaded$sce, file)
+
+    n_clusters <- loaded$n_clusters
+
+    sce <- rescale_spatial_coords_to_reference(sce, dlpfc_median_nn)
+    
+    spot_count <- ncol(sce)
+    chosen_nn <- 6
+    cl_res <- 10
+    chosen_cl_min <- 5
+    
+    if (spot_count < 200) {
+      chosen_nn <- 3         
+      cl_res <- 0.5
+      chosen_cl_min <- 2
+    }
+
+    res <- run_spatialMNN(
+      sce,
+      assay_name = assay_name,
+      level = n_clusters,
+      nn = chosen_nn,
+      cl_resolution = cl_res,
+      cl_min = chosen_cl_min,
+      sample_name = file,
+      export_path = file.path("annotation_results", model,
+                              sprintf("%s_%s_annotations.csv", dataset_name, file))
+    )
+
+    end_time <- Sys.time()
+    run_time <- end_time - start_time
+    print(run_time) 
+
+    plot_annotations(
+      res$sce, model = model, level = n_clusters, predicted = res$predicted_key,
+      tissue = dataset_name, slide = file,
+      export_path = file.path("figures", "spatial", model, sprintf("%s_%s_predicted_plot.png", dataset_name, file))
+    )
+
+    calculate_stats(
+      res$sce, model = model, predicted = res$predicted_key,
+      tissue = dataset_name, slide = file,
+      export_path = "stats.csv"
+    )
+  }
+}
+```
