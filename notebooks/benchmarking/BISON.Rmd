@@ -1,0 +1,191 @@
+---
+title: "BISON benchmarking (parallel)"
+output: html_document
+---
+
+<!--
+  Parallel variant of BISON.Rmd. Same results, but the 24 independent slides
+  run concurrently (one worker per slide) instead of serially.
+
+  What changed vs BISON.Rmd, and why:
+   * The double for-loop is flattened into a list of independent jobs and run
+     with parallel::mclapply (fork-based; Linux only). Each slide is fully
+     independent, so this is embarrassingly parallel.
+   * calculate_stats() appends to a shared stats.csv (read -> rbind -> write),
+     which is NOT safe under parallelism. Instead, each worker returns its
+     stats row (via the read-only calculate_ARI/calculate_F1 helpers) and we
+     write stats.csv ONCE at the end.
+   * plot_annotations() and save_annotations() each write to a unique per-slide
+     path, so they remain parallel-safe and are left inside the worker.
+
+  Nothing in models/ is modified. benchmarking_scripts_2.R and constants.R are
+  sourced unchanged.
+-->
+
+```{r}
+# install.packages("BiocManager")
+#
+# BiocManager::install(c("SingleCellExperiment", "scran", "scater",
+#                         "DropletUtils", "zellkonverter"))
+# install.packages(c("Matrix", "purrr", "Rcpp", "RcppArmadillo",
+#                     "clue", "mclust", "RANN", "ggplot2", "gridExtra"))
+```
+
+```{r}
+suppressMessages({
+  library(SingleCellExperiment)
+  library(scran)
+  library(scater)
+  library(Matrix)
+  library(purrr)
+  library(Rcpp)
+  library(RcppArmadillo)
+  library(parallel)
+  # HDF5Array MUST be loaded in the parent, before mclapply forks. Its .onLoad
+  # creates a single global counter file under tempdir(); forked workers share
+  # the same tempdir(), so if the first HDF5 access happens *inside* a worker
+  # they race to create that one file and all-but-one die with
+  # "HDF5Array_dump_names_global_counter ... already exists". Loading it here
+  # runs .onLoad once in the parent; children inherit the counter file.
+  library(HDF5Array)
+})
+
+## Load BISON
+old_wd <- getwd()
+setwd("models/BISON")
+source("R/utils.R")
+source("R/main.R")
+setwd(old_wd)
+
+## Loader helper functions
+source("benchmarking_scripts_2.R")
+source("constants.R")
+```
+
+```{r}
+model <- "BISON"
+
+datasets <- list(
+  "DLPFC" = DLPFC_files,
+  # "HER2+" = HER2_files,
+  "MOSTA" = MOSTA_files
+  # "Mouse hypothalamus" = mouse_hypothalamus_files
+)
+
+loaders <- list(
+  "DLPFC" = load_DLPFC,
+  "HER2+" = load_HER2,
+  "MOSTA" = load_MOSTA
+)
+
+platforms <- list(
+  DLPFC     = "Visium",
+  `HER2+`   = "ST",
+  MOSTA     = "ST"
+)
+```
+
+```{r}
+## Flatten the (dataset, slide) grid into a list of independent jobs.
+jobs <- list()
+for (dataset_name in names(datasets)) {
+  for (file in names(datasets[[dataset_name]])) {
+    jobs[[length(jobs) + 1]] <- list(dataset_name = dataset_name, file = file)
+  }
+}
+
+## One worker per slide. There are only ~24 slides, so cap at the job count.
+n_cores <- min(length(jobs), max(1, detectCores() - 1))
+
+## Runs one slide end-to-end and RETURNS its stats row (no shared writes here).
+run_one <- function(job) {
+  dataset_name <- job$dataset_name
+  file         <- job$file
+
+  loader   <- loaders[[dataset_name]]
+  platform <- platforms[[dataset_name]]
+
+  result <- tryCatch({
+    loaded     <- loader(file)
+    sce        <- loaded$sce
+    n_clusters <- loaded$n_clusters
+
+    sce <- preprocess_data(sce, file)
+
+    out <- run_BISON(
+      sce,
+      level       = n_clusters,
+      platform    = platform,
+      n_top_genes = 1000,
+      K           = n_clusters,
+      R_          = n_clusters,   # gene-cluster count; see run_BISON()'s docstring
+      n_iters     = 100,
+      seed        = 1,
+      export_path = sprintf(
+        "annotation_results/%s/%s_%s_annotations.csv",
+        model, dataset_name, file
+      )
+    )
+
+    # Unique per-slide output path -> parallel-safe, keep inside the worker.
+    plot_annotations(
+      out$sce,
+      model = model, level = n_clusters, predicted = out$predicted_key,
+      tissue = dataset_name, slide = file,
+      export_path = file.path("figures", "spatial", model,
+                              sprintf("%s_%s_predicted_plot.png", dataset_name, file))
+    )
+
+    # Read-only stat helpers -> compute here, but DON'T write the shared csv.
+    ari <- calculate_ARI(out$sce, out$predicted_key)
+    f1  <- calculate_F1(out$sce, out$predicted_key)
+
+    data.frame(
+      Model = model, Dataset = dataset_name, Slide = file,
+      ARI = ari, F1_Weighted = f1$f1_weighted, F1_Score = f1$f1_macro
+    )
+  }, error = function(e) {
+    # Don't let one bad slide kill the whole run; surface it in the results.
+    data.frame(
+      Model = model, Dataset = dataset_name, Slide = file,
+      ARI = NA_real_, F1_Weighted = NA_real_, F1_Score = NA_real_,
+      error = conditionMessage(e)
+    )
+  })
+
+  result
+}
+
+rows <- mclapply(jobs, run_one, mc.cores = n_cores, mc.preschedule = FALSE)
+```
+
+```{r}
+## Defensive: if any worker returned a non-data.frame (e.g. a hard fork crash,
+## which surfaces as a try-error), coerce it into an error row so it can't sink
+## the whole run's output at bind_rows.
+rows <- Map(function(r, job) {
+  if (is.data.frame(r)) return(r)
+  data.frame(
+    Model = model, Dataset = job$dataset_name, Slide = job$file,
+    ARI = NA_real_, F1_Weighted = NA_real_, F1_Score = NA_real_,
+    error = paste("worker returned non-data.frame:",
+                  paste(utils::head(as.character(r), 3), collapse = " | "))
+  )
+}, rows, jobs)
+
+new_stats <- dplyr::bind_rows(rows)  # tolerates the optional `error` column
+
+## Merge into stats.csv WITHOUT clobbering other models' rows: drop any existing
+## BISON rows (so re-runs replace rather than duplicate), keep everything else
+## (e.g. SpaRTaCo), then append this run. Written exactly once.
+if (file.exists("stats.csv")) {
+  existing <- read.csv("stats.csv", check.names = FALSE)
+  existing <- existing[existing$Model != model, , drop = FALSE]
+  stats <- dplyr::bind_rows(existing, new_stats)
+} else {
+  stats <- new_stats
+}
+
+print(new_stats)
+write.csv(stats, "stats.csv", row.names = FALSE)
+```

@@ -1,0 +1,222 @@
+---
+title: "SpaRTaCo benchmarking (parallel)"
+output: html_document
+---
+
+<!--
+  Parallel variant of SpaRTaCo.Rmd. The independent slides run concurrently
+  (one worker per slide) instead of serially.
+
+  IMPORTANT -- why this uses a PSOCK cluster, NOT mclapply (fork), unlike
+  BISON_parallel.Rmd:
+
+    spartaco::spartaco() parallelises ITSELF internally. It ships its own
+    mclapply2(), which opens a fifo(tempfile()), forks a progress-monitor
+    process (parallel:::mcfork()), and shuttles data with readBin/writeBin
+    while drawing a txtProgressBar. If we wrap spartaco() inside our own
+    fork-based mclapply(), we get NESTED forking: N outer fork-workers each
+    running spartaco's inner fork+fifo machinery, all sharing inherited file
+    descriptors and the same stdout. The progress/verbose streams interleave
+    and corrupt each other -> "Error in rawToChar(bytes): embedded nul in
+    string" -> dead workers -> the whole (multi-hour) run dies at the final
+    bind_rows. (BISON has no such internal parallelism, so fork is fine there.)
+
+    A PSOCK cluster gives each slide its OWN independent R process (separate
+    tempdir, fifos, stdout, and HDF5 dump dir), so spartaco runs exactly as it
+    does in a clean serial session -- which works. We also pass verbose = FALSE
+    and cap spartaco's internal cores per worker to keep total load in check.
+
+  Other notes:
+   * calculate_stats() appends to a shared stats.csv (read -> rbind -> write),
+     which is NOT safe under parallelism. Each worker instead RETURNS its stats
+     row (read-only calculate_ARI/calculate_F1) and we write stats.csv ONCE at
+     the end, merging by model so BISON's rows are preserved.
+   * plot_annotations()/save_annotations() write unique per-slide paths inside
+     the worker -> parallel-safe.
+   * Nothing in models/ is modified. benchmarking_scripts_2.R and constants.R
+     are sourced unchanged (on both master and workers).
+-->
+
+```{r}
+## Install SpaRTaCo once (skip if already present -- avoids a network hit and a
+## rebuild on every knit).
+if (!requireNamespace("spartaco", quietly = TRUE)) {
+  remotes::install_github("andreasottosanti/spartaco", build_vignettes = TRUE)
+}
+```
+
+```{r}
+library(parallel)
+
+## Master only needs the dataset -> slide grid to build the job list; the heavy
+## libraries and helpers are loaded on the workers.
+source("constants.R")
+proj_dir <- getwd()
+
+model <- "SpaRTaCo"
+
+datasets <- list(
+  "DLPFC" = DLPFC_files,
+  "HER2+" = HER2_files,
+  "MOSTA" = MOSTA_files
+  # "Mouse hypothalamus" = mouse_hypothalamus_files
+)
+```
+
+```{r}
+## Flatten the (dataset, slide) grid into a list of independent jobs.
+jobs <- list()
+for (dataset_name in names(datasets)) {
+  for (file in names(datasets[[dataset_name]])) {
+    jobs[[length(jobs) + 1]] <- list(dataset_name = dataset_name, file = file)
+  }
+}
+
+## PSOCK sizing + BLAS thread cap.
+##
+## spartaco's heavy work is multithreaded OpenBLAS linear algebra. Left uncapped,
+## EACH worker process spawns one BLAS thread per core (~56 here), so a handful
+## of workers push the load average to 200+ on a 56-core box -- catastrophic
+## thrashing that makes the run far slower (not an error, just self-sabotage).
+##
+## Fix: cap BLAS threads per worker so n_workers * blas_per stays under the core
+## count. OpenBLAS reads OPENBLAS_NUM_THREADS/OMP_NUM_THREADS at process startup;
+## PSOCK workers inherit them from this master, which inherits them from the
+## shell that launched R. So set them at launch, e.g.:
+##     OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=4 Rscript -e 'rmarkdown::render(...)'
+## (RhpcBLASctl, which could set this at runtime, isn't installed here.)
+avail     <- max(1L, detectCores() - 2L)
+blas_per  <- max(1L, as.integer(Sys.getenv("OPENBLAS_NUM_THREADS", unset = "1")))
+n_workers <- min(length(jobs), max(1L, avail %/% blas_per))
+message(sprintf("SpaRTaCo parallel: %d workers x %d BLAS threads = %d cores (of %d)",
+                n_workers, blas_per, n_workers * blas_per, detectCores()))
+
+## Runs one slide end-to-end and RETURNS its stats row (no shared writes here).
+## Runs on a PSOCK worker; it resolves model/loaders/assay_names and the helper
+## functions from the worker's global env (populated by clusterEvalQ below).
+run_one <- function(job) {
+  dataset_name <- job$dataset_name
+  file         <- job$file
+
+  loader     <- loaders[[dataset_name]]
+  assay_name <- assay_names[[dataset_name]]
+
+  tryCatch({
+    loaded     <- loader(file)
+    sce        <- preprocess_data(loaded$sce, file)
+    n_clusters <- loaded$n_clusters
+
+    res <- run_spartaco(
+      sce,
+      level       = n_clusters,
+      sample_name = file,
+      assay_name  = assay_name,
+      K           = 10,          # tune independently of n_clusters
+      verbose     = FALSE,       # silence spartaco's progress fifo/mcfork
+      export_path = file.path(
+        "annotation_results", model,
+        sprintf("%s_%s_annotations.csv", dataset_name, file)
+      )
+    )
+
+    plot_annotations(
+      res$sce,
+      model = model, level = n_clusters, predicted = res$predicted_key,
+      tissue = dataset_name, slide = file,
+      export_path = file.path("figures", "spatial", model,
+                              sprintf("%s_%s_predicted_plot.png", dataset_name, file))
+    )
+
+    ari <- calculate_ARI(res$sce, res$predicted_key)
+    f1  <- calculate_F1(res$sce, res$predicted_key)
+
+    data.frame(
+      Model = model, Dataset = dataset_name, Slide = file,
+      ARI = ari, F1_Weighted = f1$f1_weighted, F1_Score = f1$f1_macro
+    )
+  }, error = function(e) {
+    # Don't let one bad slide kill the whole run; surface it in the results.
+    data.frame(
+      Model = model, Dataset = dataset_name, Slide = file,
+      ARI = NA_real_, F1_Weighted = NA_real_, F1_Score = NA_real_,
+      error = conditionMessage(e)
+    )
+  })
+}
+
+cl <- makeCluster(n_workers, type = "PSOCK")
+
+## NB: do NOT use on.exit(stopCluster(cl)) here. knitr evaluates chunk code
+## outside a function, so an on.exit() fires almost immediately and tears the
+## cluster down BEFORE we use it -> clusterExport hits "invalid connection".
+## Use tryCatch(..., finally=) so the cluster is still cleaned up on error.
+rows <- tryCatch({
+  ## Each worker is an independent process: set the project wd (loaders use
+  ## relative paths), bound spartaco's internal fork width, load libraries,
+  ## source the (unchanged) helpers, and define the per-model config it looks up.
+  clusterExport(cl, c("proj_dir", "blas_per"), envir = environment())
+  clusterEvalQ(cl, {
+    setwd(proj_dir)
+    ## Belt-and-suspenders: also set the BLAS caps inside the worker (they were
+    ## already inherited from the master's env at spawn; this is a no-op if so).
+    Sys.setenv(OPENBLAS_NUM_THREADS = blas_per, OMP_NUM_THREADS = blas_per)
+    if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+      RhpcBLASctl::blas_set_num_threads(blas_per)
+      RhpcBLASctl::omp_set_num_threads(blas_per)
+    }
+    options(mc.cores = 1L)   # spartaco parallelism comes from BLAS threads, not forks
+    suppressMessages({
+      library(spartaco)
+      library(SingleCellExperiment)
+      library(HDF5Array)
+    })
+    source("benchmarking_scripts_2.R")
+    source("constants.R")
+    model <- "SpaRTaCo"
+    loaders <- list(
+      "DLPFC" = load_DLPFC,
+      "HER2+" = load_HER2,
+      "MOSTA" = load_MOSTA
+    )
+    assay_names <- list(
+      "DLPFC" = "counts",
+      "HER2+" = "counts",
+      "MOSTA" = "count"   # load_MOSTA exposes the raw layer as both "count" and "counts"
+    )
+    NULL
+  })
+  parLapply(cl, jobs, run_one)
+}, finally = {
+  stopCluster(cl)
+})
+```
+
+```{r}
+## Defensive: if any worker returned a non-data.frame (e.g. a hard crash),
+## coerce it into an error row so it can't sink the whole run's output.
+rows <- Map(function(r, job) {
+  if (is.data.frame(r)) return(r)
+  data.frame(
+    Model = model, Dataset = job$dataset_name, Slide = job$file,
+    ARI = NA_real_, F1_Weighted = NA_real_, F1_Score = NA_real_,
+    error = paste("worker returned non-data.frame:",
+                  paste(utils::head(as.character(r), 3), collapse = " | "))
+  )
+}, rows, jobs)
+
+new_stats <- dplyr::bind_rows(rows)  # tolerates the optional `error` column
+
+## Merge into stats.csv WITHOUT clobbering other models' rows: drop any existing
+## SpaRTaCo rows (so re-runs replace rather than duplicate), keep everything else
+## (e.g. BISON), then append this run. Written exactly once.
+if (file.exists("stats.csv")) {
+  existing <- read.csv("stats.csv", check.names = FALSE)
+  existing <- existing[existing$Model != model, , drop = FALSE]
+  stats <- dplyr::bind_rows(existing, new_stats)
+} else {
+  stats <- new_stats
+}
+
+print(new_stats)
+write.csv(stats, "stats.csv", row.names = FALSE)
+```
