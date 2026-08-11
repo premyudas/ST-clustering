@@ -68,7 +68,7 @@ suppressMessages({
 
 
 load_DLPFC <- function(file) {
-  base <- file.path("..", "..", "app", "data",
+  base <- file.path("app", "data",
                     "Human dorsolateral prefrontal cortex (DLPFC)")
   sample_dir <- file.path(base, file)
   matrix_h5 <- file.path(sample_dir, paste0(file, "_filtered_feature_bc_matrix.h5"))
@@ -108,7 +108,7 @@ load_DLPFC <- function(file) {
 
 
 load_HER2 <- function(file) {
-  base <- file.path("..", "..", "app", "data", "HER2+ breast cancer")
+  base <- file.path("app", "data", "HER2+ breast cancer")
   
   # Counts (ST-cnts): spots x genes, same orientation as the pandas read_csv
   counts <- read.delim(
@@ -168,9 +168,23 @@ load_MOSTA <- function(file) {
   # zellkonverter::readH5AD is the closest R analogue of sc.read_h5ad();
   # it maps adata.obsm['spatial'] -> reducedDim(sce, "spatial") and
   # adata.obs -> colData(sce) automatically.
-  base <- file.path("..", "..", "app", "data", "Stereo-seq MOSTA")
+  base <- file.path("app", "data", "Stereo-seq MOSTA")
   sce <- zellkonverter::readH5AD(file.path(base, file, paste0(file, ".MOSTA.h5ad")))
-  
+
+  # This h5ad carries two assays: adata.X (log-normalized, non-integer) mapped
+  # to "X", and the raw integer counts mapped to "count" (singular). Two callers
+  # want the raw layer under different names: run_BISON() hardcodes an assay
+  # literally named "counts" (via logNormCounts()), while the SpaRTaCo benchmark
+  # passes assay_name = "count" straight through to run_spartaco(). So expose
+  # BOTH -- keep the native "count" and add a "counts" alias pointing at the same
+  # raw matrix. (We don't use rename_counts_assay() here: with two assays and
+  # neither named "counts" it aborts as ambiguous, and it can't know that
+  # "count", not "X", is the raw layer.)
+  an <- SummarizedExperiment::assayNames(sce)
+  if (!("counts" %in% an) && ("count" %in% an)) {
+    SummarizedExperiment::assay(sce, "counts") <- SummarizedExperiment::assay(sce, "count")
+  }
+
   # MOSTA bins are on an integer grid; derive row/col from the spatial coords
   # for find_neighbors()'s lattice construction. If your bins aren't exact
   # integers, round first.
@@ -354,138 +368,53 @@ run_BISON <- function(sce, level, platform = c("Visium", "ST"),
 
 run_spatialMNN <- function(sce,
                            level,
+                           sample_name,
                            assay_name,
-                           nn,
-                           cl_resolution,
-                           sample_name = "sample_1",
                            annotation_col = "annotation",
                            top_pcs = 8,
                            cor_threshold = 0.6,
+                           nn = 6,
+                           cl_resolution = 10,
                            cl_min = 5,
                            find_HVG = TRUE,
                            hvg = 2000,
                            cor_met = "PC",
                            edge_smoothing = TRUE,
                            use_glmpca = TRUE,
-                           stage2_method = "louvain",
-                           stage2_resolution = 1,
                            verbose = TRUE,
                            export_path = NULL) {
-
+  
   seu <- sce2Seurat(sce, annotation_col = annotation_col, assay_name = assay_name)
   seu@meta.data[["orig.ident"]] <- sample_name
-  seu_ls <- setNames(list(seu), sample_name)
-
-  seu_ls <- stage_1(seu_ls,
-                    cor_threshold = cor_threshold,
-                    nn = nn,
-                    cl_resolution = cl_resolution,
-                    top_pcs = top_pcs,
-                    cl_min = cl_min,
-                    find_HVG = find_HVG,
-                    hvg = hvg,
-                    cor_met = cor_met,
-                    edge_smoothing = edge_smoothing,
-                    use_glmpca = use_glmpca,
-                    verbose = verbose)
-
-    rtn_ls <- stage_2(seu_ls,
-                    cl_key = "merged_cluster",
-                    rtn_seurat = TRUE,
-                    top_pcs = top_pcs,
-                    use_glmpca = use_glmpca,
-                    method = stage2_method,
-                    resolution = stage2_resolution,
-                    find_HVG = find_HVG,
-                    hvg = hvg,
-                    cor_met = cor_met)
-
-  seu_ls <- assign_label(seu_ls, rtn_ls$cl_df, anno = stage2_method,
-                         cor_threshold = cor_threshold, cl_key = "merged_cluster")
-
-  sec_col <- paste0("sec_cluster_", stage2_method)
+  seurat_ls <- setNames(list(seu), sample_name)
+  
+  seurat_ls <- stage_1(seurat_ls,
+                       cor_threshold = cor_threshold,
+                       nn = nn,
+                       cl_resolution = cl_resolution,
+                       top_pcs = top_pcs,
+                       cl_min = cl_min,
+                       find_HVG = find_HVG,
+                       hvg = hvg,
+                       cor_met = cor_met,
+                       edge_smoothing = edge_smoothing,
+                       use_glmpca = use_glmpca,
+                       verbose = verbose)
+  
+  rtn_ls <- stage_2(seurat_ls, cl_key = "merged_cluster",
+                    rtn_seurat = T, nn_2 = 10, method = "MNN",
+                    top_pcs = 8, use_glmpca = T, rare_ct = "m", resolution = 1)
+  seurat_ls <- assign_label(seurat_ls, rtn_ls$cl_df, "MNN", 0.6, cl_key = "merged_cluster")
+  
   predicted_key <- paste0("spatialMNN_spot_label_", level)
   SummarizedExperiment::colData(sce)[[predicted_key]] <-
-    factor(seu_ls[[sample_name]]@meta.data[[sec_col]])
-
+    factor(seurat_ls[[sample_name]]@meta.data[["merged_cluster"]])
+  
   if (!is.null(export_path)) save_annotations(sce, predicted_key, export_path)
-
-  list(sce = sce, predicted_key = predicted_key, seurat_obj = seu_ls[[sample_name]])
+  
+  list(sce = sce, predicted_key = predicted_key, seurat_obj = seurat_ls[[sample_name]])
 }
 
-# run_spatialMNN <- function(sce,
-#                            level,
-#                            assay_name,
-#                            sample_name = "sample_1",
-#                            annotation_col = "annotation",
-#                            top_pcs = 8,
-#                            cor_threshold = 0.6,
-#                            nn = 6,
-#                            cl_resolution = 10,
-#                            cl_min = 5,
-#                            find_HVG = TRUE,
-#                            hvg = 2000,
-#                            cor_met = "PC",
-#                            edge_smoothing = TRUE,
-#                            use_glmpca = TRUE,
-#                            stage2_method = "louvain",
-#                            stage2_resolution = 1,
-#                            verbose = TRUE,
-#                            export_path = NULL) {
-# 
-#   seu <- sce2Seurat(sce, annotation_col = annotation_col, assay_name = assay_name)
-#   seu@meta.data[["orig.ident"]] <- sample_name
-#   seu_ls <- setNames(list(seu), sample_name)
-# 
-#     seu_ls <- stage_1(seu_ls,
-#                     cor_threshold = cor_threshold,
-#                     nn = nn,
-#                     cl_resolution = cl_resolution,
-#                     top_pcs = top_pcs,
-#                     cl_min = cl_min,
-#                     find_HVG = find_HVG,
-#                     hvg = hvg,
-#                     cor_met = cor_met,
-#                     edge_smoothing = edge_smoothing,
-#                     use_glmpca = use_glmpca,
-#                     verbose = verbose)
-# 
-#   n_niches <- length(unique(seu_ls[[sample_name]]@meta.data[["merged_cluster"]]))
-#   stage2_top_pcs <- min(top_pcs, n_niches - 1)
-#   if (stage2_top_pcs < top_pcs) {
-#     warning(sprintf(
-#       "%s: only %d stage_1 niches found; reducing stage_2 top_pcs from %d to %d.",
-#       sample_name, n_niches, top_pcs, stage2_top_pcs))
-#   }
-#   if (stage2_top_pcs < 2) {
-#     stop(sprintf(
-#       "%s: stage_1 produced only %d niche(s) -- too few for stage_2 consolidation. Lower cl_resolution/cor_threshold sensitivity or check this sample's input.",
-#       sample_name, n_niches))
-#   }
-# 
-#   rtn_ls <- stage_2(seu_ls,
-#                     cl_key = "merged_cluster",
-#                     rtn_seurat = TRUE,
-#                     top_pcs = stage2_top_pcs,
-#                     use_glmpca = use_glmpca,
-#                     method = stage2_method,
-#                     resolution = stage2_resolution,
-#                     find_HVG = find_HVG,
-#                     hvg = hvg,
-#                     cor_met = cor_met)
-# 
-#   seu_ls <- assign_label(seu_ls, rtn_ls$cl_df, anno = stage2_method,
-#                          cor_threshold = cor_threshold, cl_key = "merged_cluster")
-# 
-#   sec_col <- paste0("sec_cluster_", stage2_method)
-#   predicted_key <- paste0("spatialMNN_spot_label_", level)
-#   SummarizedExperiment::colData(sce)[[predicted_key]] <-
-#     factor(seu_ls[[sample_name]]@meta.data[[sec_col]])
-# 
-#   if (!is.null(export_path)) save_annotations(sce, predicted_key, export_path)
-# 
-#   list(sce = sce, predicted_key = predicted_key, seurat_obj = seu_ls[[sample_name]])
-# }
 
 run_spartaco <- function(sce,
                          level,
@@ -517,13 +446,18 @@ run_spartaco <- function(sce,
   coordinates <- reducedDim(sce, "spatial")
   coordinates <- coordinates[colnames(counts), , drop = FALSE]
   
+  # Forward `verbose` to spartaco(). Its progress display (an mclapply2 fifo +
+  # a forked progress monitor + a txtProgressBar) is what corrupts under nested
+  # forking, so callers running many slides concurrently should pass verbose =
+  # FALSE. Serial callers keep the default TRUE and are unaffected.
   fit <- spartaco::spartaco(
     data = counts,
     coordinates = coordinates,
     K = K,
     R = R,
     max.iter = max.iter,
-    conv.criterion = conv.criterion
+    conv.criterion = conv.criterion,
+    verbose = verbose
   )
   
   predicted_key <- paste0("spartaco_spot_label_", level)
