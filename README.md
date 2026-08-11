@@ -8,7 +8,7 @@ app/ \
                 |__HER2+ breast cancer/ \
                 |__Stereo-seq MOSTA/ \
 notebooks/ \
-        |__benchmarking/ \
+        |__benchmarking/
 
 To run each Python notebook in `benchmarking`:
 1. Create virtual environment
