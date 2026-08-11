@@ -1,7 +1,7 @@
 # ST-clustering
 This repository contains the code used to benchmark the seven clustering algorithms (spatialMNN, BISON, SpaRTaCo, Novae, HyperGCN, STMSGAL, SCOIGET) and generate plots.
 
-To run each notebook in benchmarking:
+To run each Python notebook in `benchmarking`:
 1. Create virtual environment
     
     `python3 -m venv .venv`
